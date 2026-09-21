@@ -23,7 +23,7 @@ jobs:
         id: discovery
         env:
           REPOSITORY_ROOT: .github/stubs/workspace-fixture
-          PACKAGE_JSON_PATH: package.json
+          PACKAGE_JSON_PATHS: package.json
         run: |
           node auto-audit/discover-package-files.mjs
 
@@ -158,3 +158,188 @@ jobs:
 
           [[ "$CHANGED" == "false" ]]
           git -C "$RUNNER_TEMP/apply-fix-fixture" diff --exit-code
+
+      - name: Prepare multiple package roots fixture
+        run: |
+          set -euo pipefail
+
+          fixture="$RUNNER_TEMP/multiple-package-roots-fixture"
+
+          rm -rf "$fixture"
+
+          mkdir -p \
+            "$fixture/frontend" \
+            "$fixture/api" \
+            "$fixture/tools"
+
+          cat > "$fixture/frontend/package.json" <<'JSON'
+          {
+            "name": "frontend",
+            "version": "1.0.0",
+            "private": true
+          }
+          JSON
+
+          cat > "$fixture/frontend/package-lock.json" <<'JSON'
+          {
+            "name": "frontend",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "frontend",
+                "version": "1.0.0"
+              }
+            }
+          }
+          JSON
+
+          cat > "$fixture/api/package.json" <<'JSON'
+          {
+            "name": "api",
+            "version": "1.0.0",
+            "private": true
+          }
+          JSON
+
+          cat > "$fixture/api/package-lock.json" <<'JSON'
+          {
+            "name": "api",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "api",
+                "version": "1.0.0"
+              }
+            }
+          }
+          JSON
+
+          cat > "$fixture/tools/package.json" <<'JSON'
+          {
+            "name": "tools",
+            "version": "1.0.0",
+            "private": true
+          }
+          JSON
+
+          cat > "$fixture/tools/package-lock.json" <<'JSON'
+          {
+            "name": "tools",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "tools",
+                "version": "1.0.0"
+              }
+            }
+          }
+          JSON
+
+      - name: Test multiple independent package roots
+        id: multiple_roots
+        env:
+          REPOSITORY_ROOT: ${{ runner.temp }}/multiple-package-roots-fixture
+          PACKAGE_JSON_PATHS: |
+            frontend/package.json
+            api/package.json
+            tools/package.json
+            frontend/package.json
+        run: |
+          set -euo pipefail
+
+          node auto-audit/discover-package-files.mjs
+
+      - name: Assert multiple package roots discovered
+        env:
+          PACKAGE_FILES: ${{ steps.multiple_roots.outputs.package-json-files }}
+        run: |
+          set -euo pipefail
+
+          jq -e '
+            length == 3 and
+            index("frontend/package.json") != null and
+            index("api/package.json") != null and
+            index("tools/package.json") != null
+          ' <<< "$PACKAGE_FILES"
+
+      - name: Assert multiple package directories discovered
+        env:
+          PACKAGE_DIRECTORIES: ${{ steps.multiple_roots.outputs.package-directories }}
+        run: |
+          set -euo pipefail
+
+          jq -e '
+            length == 3 and
+            index("frontend") != null and
+            index("api") != null and
+            index("tools") != null
+          ' <<< "$PACKAGE_DIRECTORIES"
+
+      - name: Assert multiple root PR files
+        env:
+          PR_FILES: ${{ steps.multiple_roots.outputs.pr-files }}
+        run: |
+          set -euo pipefail
+
+          expected_files=(
+            "api/package-lock.json"
+            "api/package.json"
+            "frontend/package-lock.json"
+            "frontend/package.json"
+            "tools/package-lock.json"
+            "tools/package.json"
+          )
+
+          for expected_file in "${expected_files[@]}"; do
+            grep -Fx "$expected_file" <<< "$PR_FILES"
+          done
+
+          actual_count="$(
+            sed '/^[[:space:]]*$/d' <<< "$PR_FILES" |
+              wc -l |
+              tr -d '[:space:]'
+          )"
+
+          [[ "$actual_count" == "6" ]]
+
+      - name: Assert duplicate configured roots are removed
+        env:
+          PACKAGE_FILES: ${{ steps.multiple_roots.outputs.package-json-files }}
+        run: |
+          set -euo pipefail
+
+          frontend_count="$(
+            jq '
+              [
+                .[]
+                | select(. == "frontend/package.json")
+              ]
+              | length
+            ' <<< "$PACKAGE_FILES"
+          )"
+
+          [[ "$frontend_count" == "1" ]]
+
+      - name: Assert missing package root is rejected
+        env:
+          REPOSITORY_ROOT: ${{ runner.temp }}/multiple-package-roots-fixture
+          PACKAGE_JSON_PATHS: |
+            frontend/package.json
+            missing/package.json
+        run: |
+          set -euo pipefail
+
+          if node auto-audit/discover-package-files.mjs > error.log 2>&1; then
+            echo "Expected discovery to reject a missing package.json" >&2
+            exit 1
+          fi
+
+          grep -F \
+            "Configured package.json does not exist: missing/package.json" \
+            error.log

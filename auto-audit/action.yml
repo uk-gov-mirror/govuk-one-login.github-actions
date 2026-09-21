@@ -2,10 +2,13 @@ name: Auto Audit
 description: Audit npm dependencies and apply vulnerability fixes
 
 inputs:
-  package-json-path:
-    description: Path to the root package.json
+  package-json-paths:
+    description: |
+      Package.json files to evaluate, one per line.
+      Workspace package.json files are discovered automatically.
     required: false
-    default: package.json
+    default: |
+      package.json
 
   node-version:
     description: Node.js version used by Auto Audit
@@ -78,7 +81,7 @@ runs:
       shell: bash
       env:
         REPOSITORY_ROOT: ${{ github.workspace }}
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PACKAGE_JSON_PATHS: ${{ inputs.package-json-paths }}
         DISCOVER_PACKAGES: ${{ github.action_path }}/discover-package-files.mjs
       run: |
         set -euo pipefail
@@ -104,7 +107,7 @@ runs:
     - name: Run npm audit
       shell: bash
       env:
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PACKAGE_JSON_PATHS: ${{ inputs.package-json-paths }}
       run: |
         set -euo pipefail
 
@@ -190,7 +193,7 @@ runs:
       shell: bash
       env:
         AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PACKAGE_JSON_PATHS: ${{ inputs.package-json-paths }}
         PR_FILES: ${{ steps.discover.outputs.pr-files }}
         APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
       run: |
@@ -241,7 +244,7 @@ runs:
       shell: bash
       env:
         AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PACKAGE_JSON_PATHS: ${{ inputs.package-json-paths }}
         PR_FILES: ${{ steps.discover.outputs.pr-files }}
         APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
       run: |
@@ -292,7 +295,7 @@ runs:
       shell: bash
       env:
         AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PACKAGE_JSON_PATHS: ${{ inputs.package-json-paths }}
         PR_FILES: ${{ steps.discover.outputs.pr-files }}
         APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
       run: |

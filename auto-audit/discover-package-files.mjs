@@ -9,20 +9,38 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 
 const repositoryRoot = resolve(process.env.REPOSITORY_ROOT ?? process.cwd());
 
-const configuredPackageJson = process.env.PACKAGE_JSON_PATH ?? "package.json";
+const configuredPackageJsonPaths =
+  process.env.PACKAGE_JSON_PATHS ??
+  process.env.PACKAGE_JSON_PATH ??
+  "package.json";
 
 const githubOutput = process.env.GITHUB_OUTPUT;
 
-function normalisePath(path) {
-  return path.split(sep).join("/");
+function normalisePath(filePath) {
+  return filePath.split(sep).join("/");
 }
 
-function readPackageJson(path) {
+function readPackageJson(filePath) {
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    return JSON.parse(readFileSync(filePath, "utf8"));
   } catch (error) {
-    throw new Error(`Unable to read ${path}: ${error.message}`);
+    throw new Error(`Unable to read ${filePath}: ${error.message}`);
   }
+}
+
+function getConfiguredPackageFiles(value) {
+  const packageFiles = value
+    .split(/\r?\n/)
+    .map((filePath) => filePath.trim())
+    .filter(Boolean);
+
+  if (packageFiles.length === 0) {
+    throw new Error(
+      "PACKAGE_JSON_PATHS did not contain any package.json paths"
+    );
+  }
+
+  return [...new Set(packageFiles)];
 }
 
 function getWorkspacePatterns(packageJson) {
@@ -72,16 +90,22 @@ function walkDirectories(root) {
       }
 
       const fullPath = join(currentPath, entry.name);
+
       directories.push(fullPath);
       walk(fullPath);
     }
   }
 
   walk(root);
+
   return directories;
 }
 
 function resolveWorkspacePackageFiles(rootPackageDirectory, workspacePatterns) {
+  if (workspacePatterns.length === 0) {
+    return [];
+  }
+
   const directories = walkDirectories(rootPackageDirectory);
   const packageFiles = new Set();
 
@@ -123,33 +147,78 @@ function writeOutput(name, value) {
   appendFileSync(githubOutput, `${name}=${value}\n`);
 }
 
-const rootPackageJsonPath = resolve(repositoryRoot, configuredPackageJson);
+function writeMultilineOutput(name, value) {
+  if (!githubOutput) {
+    return;
+  }
 
-if (!existsSync(rootPackageJsonPath)) {
-  throw new Error(
-    `Configured package.json does not exist: ${configuredPackageJson}`
+  const delimiter = `AUTO_AUDIT_${name.toUpperCase().replaceAll("-", "_")}_EOF`;
+
+  appendFileSync(
+    githubOutput,
+    `${name}<<${delimiter}\n${value}\n${delimiter}\n`
   );
 }
 
-const rootPackage = readPackageJson(rootPackageJsonPath);
-const rootPackageDirectory = dirname(rootPackageJsonPath);
-const workspacePatterns = getWorkspacePatterns(rootPackage);
+const configuredPackageFiles = getConfiguredPackageFiles(
+  configuredPackageJsonPaths
+);
 
-const discoveredPackageFiles = [
-  rootPackageJsonPath,
-  ...resolveWorkspacePackageFiles(rootPackageDirectory, workspacePatterns),
-];
+console.log("Configured package.json files:");
 
-const uniquePackageFiles = [...new Set(discoveredPackageFiles)].sort();
+for (const configuredPackageFile of configuredPackageFiles) {
+  console.log(` - ${configuredPackageFile}`);
+}
 
-const relativePackageFiles = uniquePackageFiles.map((path) =>
-  normalisePath(relative(repositoryRoot, path))
+const discoveredPackageFiles = new Set();
+const workspacePatternsByRoot = new Map();
+
+for (const configuredPackageFile of configuredPackageFiles) {
+  const packageJsonPath = resolve(repositoryRoot, configuredPackageFile);
+
+  if (!existsSync(packageJsonPath)) {
+    throw new Error(
+      `Configured package.json does not exist: ${configuredPackageFile}`
+    );
+  }
+
+  if (!statSync(packageJsonPath).isFile()) {
+    throw new Error(
+      `Configured package.json is not a file: ${configuredPackageFile}`
+    );
+  }
+
+  const packageJson = readPackageJson(packageJsonPath);
+  const packageDirectory = dirname(packageJsonPath);
+  const workspacePatterns = getWorkspacePatterns(packageJson);
+
+  discoveredPackageFiles.add(packageJsonPath);
+
+  const workspacePackageFiles = resolveWorkspacePackageFiles(
+    packageDirectory,
+    workspacePatterns
+  );
+
+  for (const workspacePackageFile of workspacePackageFiles) {
+    discoveredPackageFiles.add(workspacePackageFile);
+  }
+
+  workspacePatternsByRoot.set(
+    normalisePath(relative(repositoryRoot, packageJsonPath)),
+    workspacePatterns
+  );
+}
+
+const uniquePackageFiles = [...discoveredPackageFiles].sort();
+
+const relativePackageFiles = uniquePackageFiles.map((filePath) =>
+  normalisePath(relative(repositoryRoot, filePath))
 );
 
 const lockFiles = uniquePackageFiles
-  .map((path) => join(dirname(path), "package-lock.json"))
-  .filter((path) => existsSync(path))
-  .map((path) => normalisePath(relative(repositoryRoot, path)));
+  .map((filePath) => join(dirname(filePath), "package-lock.json"))
+  .filter((filePath) => existsSync(filePath) && statSync(filePath).isFile())
+  .map((filePath) => normalisePath(relative(repositoryRoot, filePath)));
 
 console.log("Package.json files that will be evaluated:");
 
@@ -157,10 +226,14 @@ for (const packageFile of relativePackageFiles) {
   console.log(` - ${packageFile}`);
 }
 
-if (workspacePatterns.length === 0) {
-  console.log("The configured package.json does not declare npm workspaces.");
-} else {
-  console.log("Workspace patterns:");
+for (const [rootPackageFile, workspacePatterns] of workspacePatternsByRoot) {
+  if (workspacePatterns.length === 0) {
+    console.log(`${rootPackageFile} does not declare npm workspaces.`);
+
+    continue;
+  }
+
+  console.log(`Workspace patterns declared by ${rootPackageFile}:`);
 
   for (const pattern of workspacePatterns) {
     console.log(` - ${pattern}`);
@@ -169,25 +242,22 @@ if (workspacePatterns.length === 0) {
 
 const filesForPullRequest = [
   ...new Set([...relativePackageFiles, ...lockFiles]),
-].join("\n");
+]
+  .sort()
+  .join("\n");
 
 const packageDirectories = [
   ...new Set(
-    relativePackageFiles.map((path) => {
-      const packageDirectory = dirname(path);
+    relativePackageFiles.map((filePath) => {
+      const packageDirectory = dirname(filePath);
 
       return packageDirectory === "." ? "." : normalisePath(packageDirectory);
     })
   ),
-];
+].sort();
 
 writeOutput("package-json-files", JSON.stringify(relativePackageFiles));
 
 writeOutput("package-directories", JSON.stringify(packageDirectories));
 
-if (githubOutput) {
-  appendFileSync(
-    githubOutput,
-    `pr-files<<AUTO_AUDIT_EOF\n${filesForPullRequest}\nAUTO_AUDIT_EOF\n`
-  );
-}
+writeMultilineOutput("pr-files", filesForPullRequest);

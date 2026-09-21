@@ -2,10 +2,6 @@ name: Auto Audit
 description: Audit npm dependencies and apply vulnerability fixes
 
 inputs:
-  operation:
-    description: Operation to run, either audit or fix
-    required: true
-
   package-json-path:
     description: Path to the root package.json
     required: false
@@ -23,28 +19,6 @@ inputs:
   private-key:
     description: GitHub App private key
     required: true
-
-  bucket:
-    description: Vulnerability bucket to fix
-    required: false
-
-  audit-summary:
-    description: Path to audit-summary.json for the fix operation
-    required: false
-    default: audit-summary.json
-
-  pr-files:
-    description: Package and lock files eligible for a remediation PR
-    required: false
-
-  base-ref:
-    description: Base branch for remediation pull requests
-    required: false
-
-  artifact-name:
-    description: Name of the npm audit report artifact
-    required: false
-    default: npm-audit-report
 
 outputs:
   buckets:
@@ -67,70 +41,23 @@ outputs:
     description: Package and lock files eligible for a remediation PR
     value: ${{ steps.discover.outputs.pr-files }}
 
-  changed:
-    description: Whether dependency files changed
-    value: ${{ steps.apply.outputs.changed }}
-
-  branch:
-    description: Remediation pull request branch
-    value: ${{ steps.apply.outputs.branch }}
-
-  title:
-    description: Remediation pull request title
-    value: ${{ steps.apply.outputs.title }}
-
-  commit-message:
-    description: Remediation commit message
-    value: ${{ steps.apply.outputs.commit_message }}
-
-  body-path:
-    description: Remediation pull request body path
-    value: ${{ steps.apply.outputs.body_path }}
-
 runs:
   using: composite
 
   steps:
-    - name: Validate operation
+    - name: Resolve base branch
+      id: base
       shell: bash
       env:
-        OPERATION: ${{ inputs.operation }}
+        BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
       run: |
         set -euo pipefail
+        echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
 
-        case "$OPERATION" in
-          audit | fix)
-            ;;
-          *)
-            echo "operation must be either audit or fix" >&2
-            exit 1
-            ;;
-        esac
-
-    - name: Validate fix inputs
-      if: ${{ inputs.operation == 'fix' }}
-      shell: bash
-      env:
-        BUCKET: ${{ inputs.bucket }}
-        PR_FILES: ${{ inputs.pr-files }}
-        BASE_REF: ${{ inputs.base-ref }}
-      run: |
-        set -euo pipefail
-
-        if [[ -z "$BUCKET" ]]; then
-          echo "bucket is required for the fix operation" >&2
-          exit 1
-        fi
-
-        if [[ -z "$PR_FILES" ]]; then
-          echo "pr-files is required for the fix operation" >&2
-          exit 1
-        fi
-
-        if [[ -z "$BASE_REF" ]]; then
-          echo "base-ref is required for the fix operation" >&2
-          exit 1
-        fi
+    - name: Pull repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ steps.base.outputs.ref }}
 
     - name: Generate GitHub App token
       id: app-token
@@ -146,34 +73,25 @@ runs:
         cache: npm
         cache-dependency-path: "**/package-lock.json"
 
-    - name: Resolve base branch
-      id: base
-      if: ${{ inputs.operation == 'audit' }}
-      shell: bash
-      env:
-        BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
-      run: |
-        echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
-
     - name: Discover package files
       id: discover
-      if: ${{ inputs.operation == 'audit' }}
       shell: bash
       env:
         REPOSITORY_ROOT: ${{ github.workspace }}
         PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
         DISCOVER_PACKAGES: ${{ github.action_path }}/discover-package-files.mjs
       run: |
+        set -euo pipefail
         node "$DISCOVER_PACKAGES"
 
     - name: Log discovered outputs
-      if: ${{ inputs.operation == 'audit' }}
       shell: bash
       env:
         PACKAGE_FILES: ${{ steps.discover.outputs.package-json-files }}
         PACKAGE_DIRECTORIES: ${{ steps.discover.outputs.package-directories }}
         PR_FILES: ${{ steps.discover.outputs.pr-files }}
       run: |
+        set -euo pipefail
         echo "Discovered package.json files:"
         echo "$PACKAGE_FILES"
 
@@ -184,7 +102,6 @@ runs:
         echo "$PR_FILES"
 
     - name: Run npm audit
-      if: ${{ inputs.operation == 'audit' }}
       shell: bash
       env:
         PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
@@ -203,27 +120,60 @@ runs:
 
     - name: Bucket vulnerabilities
       id: parse
-      if: ${{ inputs.operation == 'audit' }}
       shell: bash
       env:
         AUDIT_FILE: ${{ runner.temp }}/audit.json
         AUDIT_SUMMARY_FILE: ${{ runner.temp }}/audit-summary.json
         PARSE_AUDIT: ${{ github.action_path }}/parse-audit.mjs
       run: |
+        set -euo pipefail
         node "$PARSE_AUDIT"
 
+    - name: Resolve remediation buckets
+      id: remediation
+      shell: bash
+      env:
+        AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
+      run: |
+        set -euo pipefail
+        node <<'JS'
+        const fs = require("fs");
+        const summary = JSON.parse(
+        fs.readFileSync(process.env.AUDIT_SUMMARY, "utf8"),
+        );
+
+        const hasEntries = bucket =>
+        Array.isArray(summary[bucket]) &&
+        summary[bucket].length > 0;
+
+        const output = process.env.GITHUB_OUTPUT;
+
+        fs.appendFileSync(
+        output,
+        `safe=${hasEntries("safe")}\n`,
+        );
+
+        fs.appendFileSync(
+        output,
+        `force_non_breaking=${hasEntries("forceNonBreaking")}\n`,
+        );
+
+        fs.appendFileSync(
+        output,
+        `breaking=${hasEntries("breaking")}\n`,
+        );
+        JS
+
     - name: Archive audit report
-      if: ${{ inputs.operation == 'audit' }}
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ inputs.artifact-name }}
+        name: npm-audit-report
         retention-days: 3
         path: |
           ${{ runner.temp }}/audit.json
           ${{ runner.temp }}/audit-summary.json
 
     - name: Sync unfixable vulnerabilities issue
-      if: ${{ inputs.operation == 'audit' }}
       shell: bash
       env:
         GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -231,52 +181,133 @@ runs:
         AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
         SYNC_UNFIXABLE_ISSUE: ${{ github.action_path }}/sync-unfixable-issue.sh
       run: |
+        set -euo pipefail
         bash "$SYNC_UNFIXABLE_ISSUE"
 
-    - name: Fetch audit report
-      if: ${{ inputs.operation == 'fix' }}
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ inputs.artifact-name }}
-        path: ${{ runner.temp }}/audit
-
-    - name: Install dependencies
-      if: ${{ inputs.operation == 'fix' }}
+    - name: Apply safe fixes
+      id: apply_safe
+      if: ${{ steps.remediation.outputs.safe == 'true' }}
       shell: bash
       env:
+        AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
         PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
-      run: |
-        set -euo pipefail
-
-        package_directory="$(dirname "$PACKAGE_JSON_PATH")"
-
-        echo "Installing dependencies from: $package_directory"
-
-        cd "$package_directory"
-        npm ci --ignore-scripts
-
-    - name: Apply fixes
-      id: apply
-      if: ${{ inputs.operation == 'fix' }}
-      shell: bash
-      env:
-        BUCKET: ${{ inputs.bucket }}
-        AUDIT_SUMMARY: ${{ runner.temp }}/audit/audit-summary.json
-        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
-        PR_FILES: ${{ inputs.pr-files }}
+        PR_FILES: ${{ steps.discover.outputs.pr-files }}
         APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
       run: |
-        bash "$APPLY_FIX" "$BUCKET"
+        set -euo pipefail
+        bash "$APPLY_FIX" safe
 
-    - name: Raise signed PR
-      if: ${{ inputs.operation == 'fix' && steps.apply.outputs.changed == 'true' }}
+    - name: Raise safe remediation PR
+      if: ${{ steps.apply_safe.outputs.changed == 'true' }}
       uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
       with:
         token: ${{ steps.app-token.outputs.token }}
         sign-commits: true
-        base: ${{ inputs.base-ref }}
-        branch: ${{ steps.apply.outputs.branch }}
-        commit-message: ${{ steps.apply.outputs.commit_message }}
-        title: ${{ steps.apply.outputs.title }}
-        body-path: ${{ steps.apply.outputs.body_path }}
-        add-paths: ${{ inputs.pr-files }}
+        base: ${{ steps.base.outputs.ref }}
+        branch: ${{ steps.apply_safe.outputs.branch }}
+        commit-message: ${{ steps.apply_safe.outputs.commit_message }}
+        title: ${{ steps.apply_safe.outputs.title }}
+        body-path: ${{ steps.apply_safe.outputs.body_path }}
+        add-paths: ${{ steps.discover.outputs.pr-files }}
+
+    - name: Restore dependency files before non-breaking remediation
+      if: ${{ always() && steps.remediation.outputs.force_non_breaking == 'true' }}
+      shell: bash
+      env:
+        PR_FILES: ${{ steps.discover.outputs.pr-files }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t pr_files <<< "$PR_FILES"
+
+        files=()
+
+        for file in "${pr_files[@]}"; do
+          if [[ -n "$file" ]]; then
+            files+=("$file")
+          fi
+        done
+
+        if [[ "${#files[@]}" -gt 0 ]]; then
+          git restore --source=HEAD --staged --worktree -- "${files[@]}"
+        fi
+
+        echo "Workspace state after restoration:"
+        git status --short
+
+    - name: Apply non-breaking out-of-range fixes
+      id: apply_force_non_breaking
+      if: ${{ steps.remediation.outputs.force_non_breaking == 'true' }}
+      shell: bash
+      env:
+        AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
+        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PR_FILES: ${{ steps.discover.outputs.pr-files }}
+        APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
+      run: |
+        set -euo pipefail
+        bash "$APPLY_FIX" forceNonBreaking
+
+    - name: Raise non-breaking remediation PR
+      if: ${{ steps.apply_force_non_breaking.outputs.changed == 'true' }}
+      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
+      with:
+        token: ${{ steps.app-token.outputs.token }}
+        sign-commits: true
+        base: ${{ steps.base.outputs.ref }}
+        branch: ${{ steps.apply_force_non_breaking.outputs.branch }}
+        commit-message: ${{ steps.apply_force_non_breaking.outputs.commit_message }}
+        title: ${{ steps.apply_force_non_breaking.outputs.title }}
+        body-path: ${{ steps.apply_force_non_breaking.outputs.body_path }}
+        add-paths: ${{ steps.discover.outputs.pr-files }}
+
+    - name: Restore dependency files before breaking remediation
+      if: ${{ always() && steps.remediation.outputs.breaking == 'true' }}
+      shell: bash
+      env:
+        PR_FILES: ${{ steps.discover.outputs.pr-files }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t pr_files <<< "$PR_FILES"
+
+        files=()
+
+        for file in "${pr_files[@]}"; do
+          if [[ -n "$file" ]]; then
+            files+=("$file")
+          fi
+        done
+
+        if [[ "${#files[@]}" -gt 0 ]]; then
+           git restore --source=HEAD --staged --worktree -- "${files[@]}"
+        fi
+
+        echo "Workspace state after restoration:"
+        git status --short
+
+    - name: Apply breaking fixes
+      id: apply_breaking
+      if: ${{ steps.remediation.outputs.breaking == 'true' }}
+      shell: bash
+      env:
+        AUDIT_SUMMARY: ${{ runner.temp }}/audit-summary.json
+        PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+        PR_FILES: ${{ steps.discover.outputs.pr-files }}
+        APPLY_FIX: ${{ github.action_path }}/apply-fix.sh
+      run: |
+        set -euo pipefail
+        bash "$APPLY_FIX" breaking
+
+    - name: Raise breaking remediation PR
+      if: ${{ steps.apply_breaking.outputs.changed == 'true' }}
+      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
+      with:
+        token: ${{ steps.app-token.outputs.token }}
+        sign-commits: true
+        base: ${{ steps.base.outputs.ref }}
+        branch: ${{ steps.apply_breaking.outputs.branch }}
+        commit-message: ${{ steps.apply_breaking.outputs.commit_message }}
+        title: ${{ steps.apply_breaking.outputs.title }}
+        body-path: ${{ steps.apply_breaking.outputs.body_path }}
+        add-paths: ${{ steps.discover.outputs.pr-files }}

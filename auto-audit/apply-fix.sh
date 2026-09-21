@@ -283,7 +283,7 @@ RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions
 
 {
   printf '%s\n\n%s\n\n' \
-    "Automated PR from the check-vulnerabilities workflow." \
+    "Automated PR from the shared Auto Audit action." \
     "$DESC"
 
   node << 'JS'
